@@ -1,0 +1,14 @@
+FROM apache/spark:3.5.7-scala2.12-java17-python3-ubuntu
+
+USER root
+
+ENV DELTA_VERSION=3.2.0
+
+RUN curl -L -o /opt/spark/jars/delta-core_2.12-${DELTA_VERSION}.jar \
+    https://repo1.maven.org/maven2/io/delta/delta-core_2.12/${DELTA_VERSION}/delta-core_2.12-${DELTA_VERSION}.jar && \
+    curl -L -o /opt/spark/jars/delta-storage-${DELTA_VERSION}.jar \
+    https://repo1.maven.org/maven2/io/delta/delta-storage/${DELTA_VERSION}/delta-storage-${DELTA_VERSION}.jar
+
+RUN mkdir -p /etc/hadoop
+
+USER spark
