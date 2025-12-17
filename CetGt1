@@ -1,0 +1,281 @@
+import sys
+import time
+from datetime import date
+
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import DecimalType
+from py4j.java_gateway import java_import
+
+
+# ============================================================
+# Spark Logger (Log4j)
+# ============================================================
+
+def get_spark_logger(spark, name="CBS_BALANCE_ETL"):
+    log4j = spark._jvm.org.apache.log4j
+    return log4j.LogManager.getLogger(name)
+
+
+# ============================================================
+# Spark Session
+# ============================================================
+
+def create_spark_session():
+    return (
+        SparkSession.builder
+        .appName("CBS_Balance_ETL")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.sql.shuffle.partitions", "8")
+        .getOrCreate()
+    )
+
+
+# ============================================================
+# Runtime Configuration
+# ============================================================
+
+HDFS_BASE = "hdfs://10.177.103.199:8022"
+BASE_INPUT_PATH = f"{HDFS_BASE}/CBS-FILES"
+DELTA_PATH = f"{HDFS_BASE}/data-lake/Fincore/StreamLake/CBS_balance"
+
+PROCESS_DATE = sys.argv[1] if len(sys.argv) > 1 else date.today().strftime("%Y-%m-%d")
+
+
+# ============================================================
+# File Parsing Configuration
+# ============================================================
+
+FILE_CONFIG = {
+    "INV": {
+        "pattern": "INV*",
+        "id": (200, 18),
+        "amount": (3, 17),
+        "sign": (19, 1),
+        "scale": 1000
+    },
+    "BOR": {
+        "pattern": "BOR*",
+        "id": (105, 18),
+        "amount": (27, 17),
+        "sign": (44, 1),
+        "scale": 10000
+    },
+    "GLCC": {
+        "pattern": "GLCC*",
+        "id": (1, 18),
+        "amount_from_end": 24,
+        "sign_from_end": 1,
+        "scale": 10000
+    }
+}
+
+
+# ============================================================
+# HDFS File Count (Metadata only)
+# ============================================================
+
+def count_files(spark, path):
+    java_import(spark._jvm, "org.apache.hadoop.fs.FileSystem")
+    java_import(spark._jvm, "org.apache.hadoop.fs.Path")
+
+    fs = spark._jvm.FileSystem.get(spark._jsc.hadoopConfiguration())
+    p = spark._jvm.Path(path)
+
+    if not fs.exists(p):
+        return 0
+
+    return len(fs.globStatus(p))
+
+
+# ============================================================
+# Fixed Width Parser
+# ============================================================
+
+def parse_records(df, cfg):
+    id_col = F.expr(f"substring(value, {cfg['id'][0]}, {cfg['id'][1]})")
+
+    if "amount" in cfg:
+        amt_col = F.expr(f"substring(value, {cfg['amount'][0]}, {cfg['amount'][1]})")
+        sign_col = F.expr(f"substring(value, {cfg['sign'][0]}, {cfg['sign'][1]})")
+    else:
+        amt_col = F.expr(f"substring(value, length(value)-{cfg['amount_from_end']}, 17)")
+        sign_col = F.expr(f"substring(value, length(value), 1)")
+
+    amount = (
+        F.when(sign_col == "-", -1)
+         .otherwise(1)
+         * F.trim(amt_col).cast(DecimalType(22, 4))
+         / cfg["scale"]
+    )
+
+    return df.select(
+        id_col.alias("Id"),
+        amount.alias("Amount")
+    )
+
+
+# ============================================================
+# Executor-side Metrics Helper
+# ============================================================
+
+def partition_counter(rows):
+    count = 0
+    for _ in rows:
+        count += 1
+    yield count
+
+
+# ============================================================
+# Load All Files
+# ============================================================
+
+def load_all_data(spark, logger):
+    dfs = []
+
+    for name, cfg in FILE_CONFIG.items():
+        path = f"{BASE_INPUT_PATH}/{PROCESS_DATE}/BANCS24/{cfg['pattern']}"
+
+        file_count = count_files(spark, path)
+        logger.info(f"{name} | Files Found: {file_count} | Path: {path}")
+
+        if file_count == 0:
+            logger.warn(f"{name} | No files found for date {PROCESS_DATE}")
+
+        raw_df = spark.read.text(path)
+        parsed_df = parse_records(raw_df, cfg)
+        dfs.append(parsed_df)
+
+    return dfs[0].unionByName(*dfs[1:])
+
+
+# ============================================================
+# Aggregation
+# ============================================================
+
+def compute_balance(df):
+    return (
+        df.groupBy("Id")
+          .agg(F.sum("Amount").alias("closing_balance"))
+          .withColumn("BALANCE_DATE", F.to_date(F.lit(PROCESS_DATE)))
+    )
+
+
+# ============================================================
+# Delta Write
+# ============================================================
+
+def write_delta(df):
+    (
+        df.repartition(8)
+          .write
+          .format("delta")
+          .mode("append")
+          .save(DELTA_PATH)
+    )
+
+
+# ============================================================
+# Oracle Write
+# ============================================================
+
+def write_oracle(df):
+    (
+        df.repartition(4)
+          .write
+          .format("jdbc")
+          .option("url", "jdbc:oracle:thin:@//host:1521/db")
+          .option("dbtable", "STREAM5_CBS_BALANCE")
+          .option("user", "fincore")
+          .option("password", "*****")
+          .option("driver", "oracle.jdbc.driver.OracleDriver")
+          .option("batchsize", "5000")
+          .option("numPartitions", "4")
+          .mode("append")
+          .save()
+    )
+
+
+# ============================================================
+# Manifest Creation
+# ============================================================
+
+def write_manifest(spark):
+    filename = f"manifest_{PROCESS_DATE}_cbsbalance.txt"
+    hdfs_path = f"{HDFS_BASE}/data-lake/spark-stream/{filename}"
+
+    java_import(spark._jvm, "org.apache.hadoop.fs.FileSystem")
+    java_import(spark._jvm, "org.apache.hadoop.fs.Path")
+
+    with open(filename, "w") as f:
+        f.write("cbs_balance successful")
+
+    fs = spark._jvm.FileSystem.get(spark._jsc.hadoopConfiguration())
+    fs.copyFromLocalFile(
+        False,
+        True,
+        spark._jvm.Path(filename),
+        spark._jvm.Path(hdfs_path)
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    spark = create_spark_session()
+    logger = get_spark_logger(spark)
+
+    spark.sparkContext.setLogLevel("WARN")
+
+    try:
+        logger.info(f"CBS Balance Job Started | Date: {PROCESS_DATE}")
+
+        # ---------- LOAD ----------
+        t0 = time.time()
+        combined_df = load_all_data(spark, logger)
+        load_time = round(time.time() - t0, 2)
+
+        partitions = combined_df.rdd.getNumPartitions()
+        partition_counts = combined_df.rdd.mapPartitions(partition_counter).collect()
+
+        logger.info(
+            f"LOAD | Time={load_time}s | Partitions={partitions} | "
+            f"Records={sum(partition_counts)} | "
+            f"Min/Max per partition={min(partition_counts)}/{max(partition_counts)}"
+        )
+
+        # ---------- AGGREGATION ----------
+        t0 = time.time()
+        final_df = compute_balance(combined_df)
+        agg_time = round(time.time() - t0, 2)
+
+        logger.info(f"AGGREGATION | Time={agg_time}s")
+
+        # ---------- DELTA ----------
+        t0 = time.time()
+        write_delta(final_df)
+        delta_time = round(time.time() - t0, 2)
+
+        logger.info(f"DELTA WRITE | Time={delta_time}s")
+
+        # ---------- ORACLE ----------
+        t0 = time.time()
+        write_oracle(final_df)
+        oracle_time = round(time.time() - t0, 2)
+
+        logger.info(f"ORACLE WRITE | Time={oracle_time}s")
+
+        # ---------- MANIFEST ----------
+        write_manifest(spark)
+        logger.info("Manifest file created")
+
+        logger.info("CBS Balance Job Completed Successfully")
+
+    except Exception:
+        logger.error("CBS Balance Job Failed", exc_info=True)
+        sys.exit(1)
+
+    finally:
+        spark.stop()
