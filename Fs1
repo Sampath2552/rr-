@@ -1,0 +1,29 @@
+from pyspark.sql import Row
+from py4j.java_gateway import java_import
+from pyspark.sql.functions import col, when, sum as _sum
+
+sc = spark.sparkContext
+java_import(sc._jvm, "org.apache.hadoop.fs.Path")
+
+fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(
+    sc._jsc.hadoopConfiguration()
+)
+
+base_path = "hdfs:///CBS-FILES/2025-12-17/BANCS24"
+path = sc._jvm.org.apache.hadoop.fs.Path(base_path)
+
+rows = []
+
+for status in fs.listStatus(path):
+    if status.isFile():
+        name = status.getPath().getName()
+
+        if name.endswith(".gz"):
+            rows.append(Row(
+                file_path=status.getPath().toString(),
+                file_name=name,
+                file_size_bytes=status.getLen(),
+                modification_time=status.getModificationTime()
+            ))
+
+files_df = spark.createDataFrame(rows)
