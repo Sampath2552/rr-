@@ -1,0 +1,40 @@
+load_balance_sql = f"""(select * from P_L_TRANSFER_BALANCE) t1"""
+load_transactions_sql = f"""(select CGL,CURRENCY,BRANCH_CODE,NARRATION,SOURCE_FLAG,BATCH_ID,DEBIT_AMOUNT,CREDIT_AMOUNT,TRANSACTION_COUNT,JOURNAL_ID,TRANSACTION_DATE from P_L_TRANSFER_TRANSACTIONS) t1"""
+load_balance = read_oracle(spark,load_balance_sql)
+load_balance = load_balance.withColumn("INR_BALANCE", col("BALANCE"))
+load_transactions = read_oracle(spark,load_transactions_sql)
+              merge_sql = f"""
+                        MERGE INTO GL_BALANCE  target
+                        USING  P_L_TRANSFER_BALANCE  source
+                        ON (
+                              target.cgl = source.cgl
+                          AND target.currency = source.currency
+                          AND target.branch_code = source.branch_code
+                          AND target.balance_date = source.balance_date
+                        )
+                        WHEN MATCHED THEN
+                        UPDATE SET
+                           target.balance = NVL(target.balance,0) + source.balance , target.inr_balance = NVL(target.balance,0) + source.balance 
+                        WHEN NOT MATCHED THEN
+                        INSERT (
+                           cgl,
+                           currency,
+                           branch_code,
+                           balance,
+                           inr_balance,
+                           balance_date
+                        )
+                        VALUES (
+                           source.cgl,
+                           source.currency,
+                           source.branch_code,
+                           source.balance,
+                           source.balance,
+                           source.balance_date
+                        )
+                        """  
+              conn.setAutoCommit(False)             
+              statement = conn.createStatement()
+              print("stmt")
+              statement.execute(merge_sql)
+write_oracle(load_transactions, "GL_TRANSACTIONS")
