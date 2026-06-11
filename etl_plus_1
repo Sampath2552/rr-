@@ -10,7 +10,11 @@ base_df = closing_balance_df.withColumn("BALANCE_DATE", lit(etl_plus_1_str).cast
 cgl_master_df = read_oracle(spark, "(SELECT CGL_NUMBER FROM CGL_MASTER WHERE BAL_FWD = 1) T1")
 circle_master_df = read_oracle(spark, "(SELECT DISTINCT BRANCH_CODE FROM CIRCLE_MASTER WHERE BRANCH_CODE IS NOT NULL) T1")
         rule_78_base = base_df.filter(F.col("CGL").rlike("^[78]"))
+                        fwd_base_df = base_df.join(F.broadcast(cgl_master_df), 
+                                    F.trim(F.col("CGL")) == F.trim(F.col("CGL_NUMBER")), 
+                                    "inner").select("CGL","CURRENCY","BRANCH_CODE","BALANCE","INR_BALANCE","BALANCE_DATE")  
         original_78 = rule_78_base.filter(F.trim(F.col("CURRENCY")) != "INR").distinct()
+
                offset_78 = original_78.withColumn("CURRENCY", F.lit("INR")) \
                                 .withColumn("BALANCE", F.negate(F.col("INR_BALANCE"))) \
                                 .withColumn("INR_BALANCE", F.negate(F.col("INR_BALANCE")))
