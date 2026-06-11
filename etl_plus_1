@@ -1,0 +1,97 @@
+gl_balance_query = f"""
+(
+    SELECT CGL, CURRENCY, BRANCH_CODE, BALANCE, INR_BALANCE
+    FROM {BALANCE}
+    WHERE BALANCE_DATE = TO_DATE('{posting_date_str}', 'YYYY-MM-DD')
+) T1
+"""
+closing_balance_df = read_oracle(spark, gl_balance_query)
+base_df = closing_balance_df.withColumn("BALANCE_DATE", lit(etl_plus_1_str).cast("date"))
+cgl_master_df = read_oracle(spark, "(SELECT CGL_NUMBER FROM CGL_MASTER WHERE BAL_FWD = 1) T1")
+circle_master_df = read_oracle(spark, "(SELECT DISTINCT BRANCH_CODE FROM CIRCLE_MASTER WHERE BRANCH_CODE IS NOT NULL) T1")
+        rule_78_base = base_df.filter(F.col("CGL").rlike("^[78]"))
+        original_78 = rule_78_base.filter(F.trim(F.col("CURRENCY")) != "INR").distinct()
+               offset_78 = original_78.withColumn("CURRENCY", F.lit("INR")) \
+                                .withColumn("BALANCE", F.negate(F.col("INR_BALANCE"))) \
+                                .withColumn("INR_BALANCE", F.negate(F.col("INR_BALANCE")))
+
+        # Union (1 Foreign + 1 INR = 2 rows)
+        df_78_final = original_78.unionByName(offset_78)
+        #df_78_final.show(20,False)
+        # --- CGL 2110505001 rule (Circle Branches) ---
+        # Now automatically respects BAL_FWD=1 because it uses fwd_base_df
+        df_circle_final = fwd_base_df.filter(F.col("CGL") == "2110505001") \
+                                        .join(F.broadcast(circle_master_df), "BRANCH_CODE", "inner")
+        
+        # --- General rule ---
+        # Excluding the 7/8 and Circle CGLs
+        df_general_final = fwd_base_df.filter(
+            (~(F.col("CGL").cast("string").rlike("^[78]"))) & 
+            (F.col("CGL").cast("string") != "2110505001")
+        )
+        df_5_base = read_oracle(spark, f"""(SELECT * FROM {BALANCE} WHERE BALANCE_DATE = TO_DATE('{posting_date_str}', 'YYYY-MM-DD') 
+                                and cgl like '5%' and cgl in (select cgl_number from cgl_master where bal_fwd='1')) T1""")
+        print(f"MEMO RAW DATAFRAME =====================================")
+        #df_5_base.show(20,False)
+
+        df_5_final = df_5_base.groupBy("BRANCH_CODE", "CURRENCY" ) \
+            .agg(
+                F.sum("BALANCE").alias("BALANCE"),
+                F.sum("INR_BALANCE").alias("INR_BALANCE")
+            ) \
+            .withColumn("CGL", F.lit("5000000000")) \
+            .withColumn("BALANCE", F.negate(F.col("BALANCE"))) \
+            .withColumn("INR_BALANCE", F.negate(F.col("INR_BALANCE"))) \
+            .withColumn("BALANCE_DATE",lit(etl_plus_1_str).cast("date"))
+        #df_5_final.show(20,False)
+        print(f"-----------------> Count of MEMO A/C ==== {df_5_final.count()}")
+        
+
+
+        
+        circle_profit = read_oracle(spark, "(SELECT * FROM p_l_transfer WHERE branch_code  = circle_branch_code) T1")
+        circle_profit = circle_profit.withColumn("CGL",lit("2110505001")) \
+        .withColumn("CURRENCY",lit("INR")) \
+        .withColumn("BALANCE",col("PROFIT_LOSS")) \
+        .withColumn("INR_BALANCE",col("PROFIT_LOSS")) \
+        .withColumn("BALANCE_DATE",lit(etl_plus_1_str).cast("date"))
+    
+        common_cols = ["CGL", "CURRENCY", "BRANCH_CODE", "BALANCE_DATE", "BALANCE", "INR_BALANCE"]
+        opening_balance_df = df_78_final.select(*common_cols) \
+                                .unionByName(df_circle_final.select(*common_cols)) \
+                                .unionByName(df_general_final.select(*common_cols)) \
+                                .unionByName(df_5_final.select(*common_cols)) \
+                                .unionByName(circle_profit.select(*common_cols))
+
+                                
+        opening_balance_df = opening_balance_df.groupBy("CGL","CURRENCY","BRANCH_CODE").agg(
+            F.sum("BALANCE").alias("BALANCE"),
+            F.sum("INR_BALANCE").alias("INR_BALANCE"),
+        ).withColumn("BALANCE_DATE",lit(etl_plus_1_str).cast("date")).select(*common_cols)
+        opening_balance_df.cache()
+
+write_oracle(
+    opening_balance_df.select(
+        col("CGL"),
+        col("CURRENCY"),
+        col("BRANCH_CODE"),
+        col("BALANCE_DATE"),
+        col("BALANCE").cast(DecimalType(25, 4)),
+        col("INR_BALANCE").cast(DecimalType(25, 4))
+    ),
+    BALANCE
+)
+
+if is_year_end:
+    overwrite_oracle(
+    opening_balance_df.select(
+        col("CGL"),
+        col("CURRENCY"),
+        col("BRANCH_CODE"),
+        col("BALANCE_DATE"),
+        col("BALANCE").cast(DecimalType(25, 4)),
+        col("INR_BALANCE").cast(DecimalType(25, 4))
+    ),
+    "GL_BALANCE_YEAR_END"
+)
+
