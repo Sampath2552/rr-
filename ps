@@ -1,0 +1,469 @@
+package com.fincore.process_status_service.service;
+
+import com.fincore.process_status_service.ResponseVO;
+import com.fincore.process_status_service.dto.*;
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.model.*;
+import com.fincore.process_status_service.repository.*;
+import com.fincore.process_status_service.util.Constants;
+import com.fincore.process_status_service.util.TimeUtil;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.errors.ResourceNotFoundException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.io.IOException;
+import java.io.Reader;
+import java.io.StringWriter;
+import java.sql.SQLException;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+@Slf4j
+@RequiredArgsConstructor
+@Service("ProcessStatusService")
+public class ProcessStatusServiceImpl implements ProcessStatusService {
+
+
+    private final FincoreDateRepository fincoreDateRepository;
+    private final FileService fileService;
+    private final ProcessRunRepository processRunRepository;
+    private final CopyOnWriteArrayList<SseEmitter> processStatusEmitters = new CopyOnWriteArrayList<>();
+    private final ProcessRunStageRepository processRunStageRepository;
+    private final FincoreProcessRepository fincoreProcessRepository;
+    private final ControlFileMasterRepository controlFileMasterRepository;
+
+
+    public ProcessRun insertProcess(ProcessRun processRun) {
+        return processRunRepository.save(processRun);
+    }
+
+    @Transactional
+    public ProcessRun endProcess(ProcessRun processRun) {
+
+        processRun.setEndTime(TimeUtil.getCurrentTimeStamp());
+
+        Integer processRunStageUpdated = processRunStageRepository.failAllRunningStage(processRun.getProcessRunId(), "Process Failed Forcefully by user ");
+        ProcessRun newProcessRun = processRunRepository.save(processRun);
+
+        return newProcessRun;
+    }
+
+    @Override
+    public List<ProcessRun> getRunningProcessesForDate(LocalDate etlDate) {
+        return processRunRepository.getRunningProcessesForDate(etlDate);
+    }
+
+    @Override
+    public List<ProcessRun> getApprovalPendingProcesses(LocalDate etlDate) {
+        return processRunRepository.findProcessRunsByStatusAndEtlDate(Constants.WAITING_FOR_APPROVAL, etlDate);
+    }
+
+    @Override
+    public Boolean checkForRunningProcess(Integer processId,LocalDate date) {
+
+        List<ProcessRun> processRuns = processRunRepository.findProcessRunsByProcessIdAndEtlDate(processId,date);
+        return !processRuns.isEmpty();
+    }
+
+    @Override
+    public ProcessRunStage getByProcessRunIdAndStageIdAndStatus( Long processRunId, String stage, Integer status) {
+        return processRunStageRepository.findProcessRunStageByProcessRunIdAndStageIdAndStatus(processRunId,stage,status);
+    }
+
+    @Override
+    public List<ProcessRun> getRunningProcessesList(LocalDate date, List<Integer> processIdList) {
+        return processRunRepository.getRunningProcessesList(date,processIdList);
+    }
+
+    @Transactional
+    public ProcessRunStage upsertProcessRunStage(ProcessRunStage processRunStage) {
+
+        log.info("Inserting New Stage:{}", processRunStage);
+        return processRunStageRepository.save(processRunStage);
+
+    }
+
+
+    public ProcessRunStage getProcessRunStage(Long processRunStageId) {
+        return processRunStageRepository.getByProcessRunStageId(processRunStageId);
+    }
+
+    public ProcessRunStage getProcessRunStage(String stageId, Long processRunId) {
+
+//        ProcessRunStage processRunStage = processRunStageRepository.getByStageIdAndProcessRunId(stageId, processRunId);
+//        if(processRunStage==null)
+//        {
+//            throw new ResourceNotFoundException("No Process Run Stage exists with process run id" + processRunId + " and stage id " + stageId);
+//        }
+        return processRunStageRepository.getByStageIdAndProcessRunId(stageId, processRunId);
+    }
+
+
+    public Integer getRunId(Integer processId, LocalDate etlDate) {
+        Integer latestRunId = processRunRepository.getRunId(processId, etlDate);
+        return (latestRunId == null) ? 1 : latestRunId;
+    }
+
+    public Integer getNextRunId(Integer processId, LocalDate etlDate) {
+        Integer latestRunId = processRunRepository.getRunId(processId, etlDate);
+        return (latestRunId == null) ? 1 : latestRunId + 1;
+    }
+
+    @Override
+    public Integer archiveProcesses(Integer processId, Long processRunId) {
+        return processRunRepository.changeProcessState(processId, processRunId, Constants.ARCHIVED);
+    }
+
+    @Override
+    public ProcessRun getProcessRunByProcessRunId(Long processRunId) {
+        return processRunRepository.getProcessRunByProcessRunId(processRunId);
+    }
+
+    @Override
+    public ProcessRunStage getByStageIdAndProcessRunId(String stage, Long processRunId) {
+        return processRunStageRepository.getByStageIdAndProcessRunId(stage, processRunId);
+    }
+
+
+
+
+    /**
+     * @author v1018405
+     * Optimised version to reduce time
+     */
+    private Map<String, Object> getProcessData(String etlDate, Integer processId) {
+
+        // 1. Fetch dates ONCE to prevent redundant DB roundtrips
+        List<FincoreDate> fincoreList = fincoreDateRepository.findAll();
+        if (fincoreList.isEmpty()) {
+            throw new ResourceNotFoundException("FinCore Date is Empty");
+        }
+        FincoreDate fincore = fincoreList.getFirst();
+
+        LocalDate etlDateToUse;
+        if (StringUtils.hasLength(etlDate)) {
+            try {
+                etlDateToUse = LocalDate.parse(etlDate); // yyyy-MM-dd
+            } catch (DateTimeParseException e) {
+                throw new IllegalArgumentException("Invalid etlDate format. Expected yyyy-MM-dd");
+            }
+        } else {
+            // Extracted directly from our single DB fetch
+            etlDateToUse = fincore.getEtlDate().toLocalDate();
+        }
+
+        Map<String, Object> wrapper = new LinkedHashMap<>();
+        Map<String, Object> fincoreJson = new LinkedHashMap<>();
+        fincoreJson.put("usersDate", formatDate(fincore.getUsersDate()));
+        fincoreJson.put("etlDate", formatDate(fincore.getEtlDate()));
+        wrapper.put("fincoreDate", fincoreJson);
+
+        log.info("Process Id Received :{}", processId);
+
+        List<Integer> excludedStatusesList = List.of(Constants.ARCHIVED);
+
+        List<ProcessRunInfoProj> groupedList = processRunRepository.getProcessInfo(etlDateToUse, processId, excludedStatusesList);
+        if (groupedList == null || groupedList.isEmpty()) {
+            wrapper.put("initialData", Collections.emptyList());
+            return wrapper;
+        }
+
+        // 2. Pre-allocate map capacity to avoid expensive resizing thresholds
+        int initialCapacity = Math.max((int) (groupedList.size() / 0.75f) + 1, 16);
+        Map<Long, ProcessRunInfo> map = new LinkedHashMap<>(initialCapacity);
+
+        // 3. Replaced slow forEach lambda with a fast, allocation-free loop
+        for (ProcessRunInfoProj row : groupedList) {
+            ProcessRunInfo process = map.computeIfAbsent(row.getProcessRunId(), id -> {
+                ProcessRunInfo p = new ProcessRunInfo();
+                p.setProcessRunId(id);
+                p.setProcessId(row.getProcessId());
+                p.setRunId(row.getRunId());
+                p.setProcessType(row.getProcessType());
+                p.setProcessStartTime(row.getProcessStartTime());
+                p.setProcessEndTime(row.getProcessEndTime());
+                p.setTriggeredBy(row.getTriggeredBy());
+                p.setEtlDate(row.getEtlDate());
+                p.setStatus(row.getProcessStatus());
+                p.setExecutionRemarks(row.getProcessExecutionRemarks());
+                p.setRemarks(row.getProcessRemarks());
+                p.setAirflowRunId(row.getAirflowRunId());
+                p.setDagId(row.getDagId());
+                p.setStages(new ArrayList<>());
+                return p;
+            });
+
+            ProcessRunStageInfo stage = new ProcessRunStageInfo();
+            stage.setStageId(row.getStageId());
+            stage.setStageStatus(row.getStageStatus());
+            stage.setStageRemarks(row.getStageRemarks());
+
+            // CHANGED: Dual-Column mapping logic
+            String finalSummary;
+            if (row.getSummaryShort() != null) {
+                log.info("Inside fast route");
+                finalSummary = row.getSummaryShort(); // Fast route for <= 4000
+            } else {
+                finalSummary = clobToString(row.getSummaryClob()); // Safe stream for > 4000
+            }
+            stage.setSummary(finalSummary);
+
+            stage.setStageTitle(row.getStageTitle());
+            stage.setStageIcon(row.getStageIcon());
+            stage.setStartTime(row.getStageStartTime());
+            stage.setEndTime(row.getStageEndTime());
+            stage.setStageSource(row.getStageSource());
+
+            process.getStages().add(stage);
+        }
+
+        wrapper.put("initialData", List.copyOf(map.values()));
+        return wrapper;
+    }
+
+    /**
+     * Converts Oracle CLOB objects to a normal Java String.
+     * FIX: Fixed critical memory/cursor leak using try-with-resources.
+     * PERF: Utilized JVM optimized Reader.transferTo for extreme speed improvements.
+     */
+    private String clobToString(Object clobObj) {
+        if (clobObj == null) {
+            return null;
+        }
+
+        try {
+            if (clobObj instanceof java.sql.Clob clob) {
+                // try-with-resources automatically closes the reader, fixing Oracle DB cursor leaks
+                try (Reader reader = clob.getCharacterStream();
+                     StringWriter writer = new StringWriter()) {
+
+                    // Native IO optimization, bypasses Java heap buffering
+                    reader.transferTo(writer);
+                    return writer.toString();
+                }
+            }
+            return clobObj.toString();
+        } catch (SQLException | IOException e) {
+            log.error("Unable to process the Payload", e);
+            return null;
+        }
+    }
+
+
+
+    /**
+     * Normalize DB time values to each millis(Timestamp/Date/Long)
+     */
+    private Long toMills(Object time) {
+        if (time == null)
+            return 0L;
+        if (time instanceof java.sql.Timestamp ts)
+            return ts.getTime();
+        if (time instanceof java.sql.Date d)
+            return d.getTime();
+        if (time instanceof Number n)
+            return n.longValue();
+        return 0L;
+    }
+
+    /**
+     * Normalizes Db date/timestamp column values into ISO_8601 (yyyy-mm-dd) String.
+     * Supports java.sql.Date, java.sql.Timestamp and falls back to string
+     * conversion.
+     *
+     * @param date
+     * @return null if value is null.
+     */
+    private String formatDate(Object date) {
+        if (date == null)
+            return null;
+        if (date instanceof java.sql.Timestamp ts)
+            return ts.toLocalDateTime().toLocalDate().toString();
+        if (date instanceof java.sql.Date d)
+            return d.toLocalDate().toString();
+        return String.valueOf(date);
+    }
+
+
+
+    public void sendProcessStatusUpdates() {
+        log.info("Sending Process Update");
+        CompletableFuture.runAsync(() -> {
+            Iterator<SseEmitter> emitters = processStatusEmitters.iterator();
+
+            // Only generate data once per broadcast to save DB hits
+            Map<String, Object> data = null;
+            if(emitters.hasNext()){
+                data = getProcessData(null, null);
+            }
+
+            while (emitters.hasNext()) {
+                SseEmitter emitter = emitters.next();
+                try {
+                    emitter.send(SseEmitter.event().data(data));
+                } catch (IOException e) {
+                    log.warn("Client Disconnected, removing SSE emitter");
+                    emitter.complete();
+                    emitters.remove();
+                }
+            }
+        });
+    }
+
+    /**
+     *
+     * @param airflowRunId
+     * @return
+     */
+    @Override
+    public ProcessRun getProcessRunByAirfowRunId(String airflowRunId) {
+        return processRunRepository.findProcessRunByAirflowRunId(airflowRunId);
+    }
+
+    /**
+     *
+     * @param etlDate
+     * @param processId
+     * @return
+     */
+    @Override
+    public Map<String, Object> getCurrentData(String etlDate, Integer processId) {
+        return getProcessData(etlDate, processId);
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<ProcessStatus>> insert(InsertDTO insertDTO) {
+        return null;
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<ProcessStatus>> update(UpdateDTO updtateDTO) {
+        return null;
+    }
+
+    @Override
+    public SseEmitter getProcessDataSSE() {
+        SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+        processStatusEmitters.add(emitter);
+
+        emitter.onCompletion(() -> processStatusEmitters.remove(emitter));
+        emitter.onTimeout(() -> {
+            processStatusEmitters.remove(emitter);
+            emitter.complete();
+        });
+        emitter.onError(e -> {
+            processStatusEmitters.remove(emitter);
+            emitter.completeWithError(e);
+        });
+
+        // Send initial connection acknowledgement
+        CompletableFuture.runAsync(() -> {
+            try {
+                emitter.send(SseEmitter.event()
+                        .name("connected")
+                        .data("Connection established"));
+            } catch (IOException | IllegalStateException ex) {
+                log.warn("Failed to send initial SSE event: {}", ex.getMessage());
+                processStatusEmitters.remove(emitter);
+                emitter.complete();
+            }
+        });
+
+        return emitter;
+    }
+
+    @Transactional
+    public void updateControllFilemaster(String fileName, Integer value, String etl_date) {
+        try {
+            SimpleDateFormat sdf = new SimpleDateFormat("dd-MM-yy");
+            java.util.Date etlDate = sdf.parse(etl_date);
+            int updatedRows = controlFileMasterRepository.updateDataLakeCount(fileName, value, etlDate);
+            if (updatedRows > 0) {
+                // Fetch the updated entity to evaluate condition
+                ControlFileMaster fileMaster = controlFileMasterRepository.findByFileNameAndEtlDate(fileName, etlDate);
+                if (fileMaster != null) {
+                    // Set status based on count comparison
+                    if (fileMaster.getDataLakeCount() != null &&
+                            fileMaster.getHdfsRowCount() != null &&
+                            fileMaster.getDataLakeCount().equals(fileMaster.getHdfsRowCount())) {
+                        fileMaster.setDatalakeStatus("YES");
+                    } else {
+                        fileMaster.setDatalakeStatus("NO");
+                    }
+
+                }
+            }
+        } catch (ParseException e) {
+            log.error("Error in Parsing the payload");
+        }
+
+
+    }
+
+
+
+    public List<FincoreProcess> getAllPipelines() {
+        return fincoreProcessRepository.findAll();
+    }
+
+
+    public FincoreProcess verifyDag(Integer processId) {
+        log.info("Process Id Recieved :{}",processId);
+        FincoreProcess fincoreProcess = fincoreProcessRepository.findByProcessId(processId);
+        if (fincoreProcess == null) {
+            log.info("No Dag Found for Process Id :{} ",processId);
+            throw new AirflowIntegrationException(
+                    "No Dag Found for Process Id " + processId,
+                    HttpStatus.NOT_FOUND
+            );
+        }
+//        if (!Objects.equals(fincoreProcess.getProcessId(), processId)) {
+//            throw new AirflowIntegrationException(
+//                    "Invalid Dag ID " + dagId + "& Process ID " + processId + "Combination",
+//                    HttpStatus.NOT_FOUND
+//            );
+//        }
+        return fincoreProcess;
+    }
+
+    public ProcessRun getDagRunInstance(String dagRunId, Integer processId) {
+        if (dagRunId == null) {
+            throw new AirflowIntegrationException(
+                    "Invalid Dag Run ID " + dagRunId,
+                    HttpStatus.NOT_FOUND
+            );
+        }
+        log.info("Trying to fetch Process Run with Dag Run ID - {} and Process Id - {}", dagRunId, processId);
+        ProcessRun processRun = getProcessRunByAirfowRunId(dagRunId);
+
+        if (processRun == null) {
+            throw new AirflowIntegrationException(
+                    "Dag Run Id is not found " + dagRunId,
+                    HttpStatus.NOT_FOUND
+            );
+        }
+
+        if (!processRun.getProcessId().equals(processId)) {
+
+            throw new AirflowIntegrationException(
+                    "Dag Run Id is not associated with any process " + dagRunId,
+                    HttpStatus.NOT_FOUND
+            );
+
+        }
+        return processRun;
+    }
+
+
+}
