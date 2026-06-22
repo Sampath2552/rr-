@@ -1,0 +1,10 @@
+[root@fcpphdfs2 ranger-admin]# grep -R "core-site.xml" /media/production-setup/ranger/ranger-admin/
+/media/production-setup/ranger/ranger-admin/setup.sh:   hadoop_conf_file=${hadoop_conf}/core-site.xml
+/media/production-setup/ranger/ranger-admin/setup.sh:        ranger_hadoop_conf_file=${WEBAPP_ROOT}/WEB-INF/classes/conf/core-site.xml
+/media/production-setup/ranger/ranger-admin/setup.sh:                   log "[WARN] Property hadoop_conf not found. Creating blank core-site.xml."
+/media/production-setup/ranger/ranger-admin/setup.sh:                                log "[WARN] core-site.xml file not found in provided hadoop_conf path. Creating blank core-site.xml"
+/media/production-setup/ranger/ranger-admin/ews/webapp/META-INF/applicationContext.xml:                         <value>classpath:core-site.xml</value>
+/media/production-setup/ranger/ranger-admin/logfile:2026-06-22 15:44:22,354  [WARN] core-site.xml file not found in provided hadoop_conf path. Creating blank core-site.xml
+/media/production-setup/ranger/ranger-admin/logfile:2026-06-22 15:53:53,148  [WARN] core-site.xml file not found in provided hadoop_conf path. Creating blank core-site.xml
+/media/production-setup/ranger/ranger-admin/logfile:2026-06-22 15:57:14,658  [WARN] core-site.xml file not found in provided hadoop_conf path. Creating blank core-site.xml
+[root@fcpphdfs2 ranger-admin]# grep -R "hdfs-site.xml" /media/production-setup/ranger/ranger-admin/
