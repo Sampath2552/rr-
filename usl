@@ -1,0 +1,33 @@
+http://nn2:8480
+
+
+
+minimums=();
+maximums=();
+means=();
+}
+The alias ranger.usersync.policymgr.password already exists!! Will try to delete first.
+FOUND value of [interactive] field in the Class [org.apache.hadoop.security.alias.CredentialShell] = [true]
+17:52:51.180 [main] DEBUG org.apache.hadoop.security.alias.AbstractJavaKeyStoreProvider -- backing jks path initialized to file:/etc/ranger/usersync/conf/rangerusersync.jceks
+Deleting credential: ranger.usersync.policymgr.password from CredentialProvider: jceks://file/etc/ranger/usersync/conf/rangerusersync.jceks
+Credential ranger.usersync.policymgr.password has been successfully deleted.
+17:52:51.212 [main] DEBUG org.apache.hadoop.security.alias.AbstractJavaKeyStoreProvider -- Writing out keystore.
+Provider jceks://file/etc/ranger/usersync/conf/rangerusersync.jceks was updated.
+17:52:51.291 [main] DEBUG org.apache.hadoop.security.alias.AbstractJavaKeyStoreProvider -- backing jks path initialized to file:/etc/ranger/usersync/conf/rangerusersync.jceks
+WARNING: You have accepted the use of the default provider password
+by not configuring a password in one of the two following locations:
+    * In the environment variable HADOOP_CREDSTORE_PASSWORD
+    * In a file referred to by the configuration entry
+      hadoop.security.credstore.java-keystore-provider.password-file.
+Please review the documentation regarding provider passwords in
+the keystore passwords section of the Credential Provider API
+Continuing with the default provider password.
+
+17:52:51.569 [main] DEBUG org.apache.hadoop.security.alias.AbstractJavaKeyStoreProvider -- Writing out keystore.
+ranger.usersync.policymgr.password has been successfully created.
+Provider jceks://file/etc/ranger/usersync/conf/rangerusersync.jceks was updated.
+17:52:51.604 [shutdown-hook-0] DEBUG org.apache.hadoop.fs.FileSystem -- FileSystem.close() by method: org.apache.hadoop.fs.FilterFileSystem.close(FilterFileSystem.java:529)); Key: (root (auth:SIMPLE))@file://; URI: file:///; Object Identity Hash: 291ea63e
+17:52:51.605 [shutdown-hook-0] DEBUG org.apache.hadoop.fs.FileSystem -- FileSystem.close() by method: org.apache.hadoop.fs.RawLocalFileSystem.close(RawLocalFileSystem.java:960)); Key: null; URI: file:///; Object Identity Hash: 23e6cd4e
+17:52:51.606 [Thread-2] DEBUG org.apache.hadoop.util.ShutdownHookManager -- Completed shutdown in 0.003 seconds; Timeouts: 0
+17:52:51.622 [Thread-2] DEBUG org.apache.hadoop.util.ShutdownHookManager -- ShutdownHookManager completed shutdown.
+[I] Successfully updated password of rangerusersync user
